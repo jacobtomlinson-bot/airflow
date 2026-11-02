@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urljoin
 
 from docutils import nodes
+from exampleinclude import ExampleHeader
 from sphinx import addnodes
 from sphinx.util import logging
 from sphinx.util.matching import Matcher
@@ -51,7 +52,6 @@ from sphinx_markdown_builder.contexts import IndentContext, SubContext, SubConte
 
 if TYPE_CHECKING:
     from sphinx.application import Sphinx
-    from sphinx.config import Config
     from sphinx.environment import BuildEnvironment
 
 logger = logging.getLogger(__name__)
@@ -219,40 +219,32 @@ def _xref_title(xref: addnodes.pending_xref, env: BuildEnvironment) -> str | Non
     return None
 
 
-def _separate_markdown_doctrees(app: Sphinx, config: Config) -> None:
-    """
-    Give the Markdown build a doctree cache of its own.
-
-    Without parallel mode sphinx-llm points the Markdown build at the HTML build's doctree cache.
-    The Markdown build would then reuse doctrees read for HTML (curly quotes, none of this
-    extension's ``doctree-read`` changes) or, once re-read, overwrite them. Its own directory sits
-    inside sphinx-llm's temporary output, which is deleted after the Markdown files are copied.
-    Sphinx creates the environment after ``config-inited``, so the change takes effect.
-    """
-    if app.tags.has("sphinx_llm_markdown"):
-        app.doctreedir = Path(app.outdir) / ".doctrees"
-
-
 def _is_markdown_build(app: Sphinx) -> bool:
     return app.builder is not None and app.builder.name == MARKDOWN_BUILDER
 
 
-def _link_example_sources(app: Sphinx, doctree: nodes.document) -> None:
+def _remember_example_sources(app: Sphinx, doctree: nodes.document) -> None:
+    # exampleinclude replaces ExampleHeader during doctree-read. Keep its filename on
+    # the wrapper so either writer can render the same cached tree appropriately.
+    for header in doctree.findall(ExampleHeader):
+        header.parent["example_source_filename"] = header["filename"]
+
+
+def _link_example_sources(app: Sphinx, doctree: nodes.document, docname: str) -> None:
     """
     Replace each ``exampleinclude`` header with a link to the whole example file.
 
-    Runs before ``exampleinclude``'s own ``doctree-read`` handler, which would otherwise turn the
-    header into a bare module path plus a "View Source" button that has no Markdown equivalent.
+    Run during output processing so Markdown can reuse the HTML build's cached doctrees
+    without changing their headers or running the source parser again.
     """
     if not _is_markdown_build(app):
         return
-    # Imported by bare name, as conf.py loads it: another import path gives a different class.
-    from exampleinclude import ExampleHeader
-
     repo_root = Path(app.config.llms_txt_repo_root).resolve()
     source_url = app.config.llms_txt_source_url.rstrip("/")
-    for header in list(doctree.findall(ExampleHeader)):
-        path = Path(header["filename"]).resolve()
+    for header in list(doctree.findall(nodes.paragraph)):
+        if "example-header" not in header["classes"] or "example_source_filename" not in header.parent:
+            continue
+        path = Path(header.parent["example_source_filename"]).resolve()
         if not source_url or not path.is_relative_to(repo_root):
             header.parent.remove(header)
             continue
@@ -477,8 +469,8 @@ def setup(app: Sphinx) -> dict[str, Any]:
     app.add_config_value("llms_txt_root_description", "", "env")
     app.add_config_value("llms_txt_optional_docs", [], "env")
     app.add_config_value("llms_txt_skip_docs", [], "env")
-    app.connect("config-inited", _separate_markdown_doctrees)
-    app.connect("doctree-read", _link_example_sources, priority=400)
+    app.connect("doctree-read", _remember_example_sources, priority=400)
+    app.connect("doctree-resolved", _link_example_sources)
     app.connect("doctree-resolved", _clean_markdown_doctree)
     app.connect("build-finished", _write_llms_txt, priority=102)
-    return {"parallel_read_safe": True, "parallel_write_safe": True}
+    return {"env_version": 1, "parallel_read_safe": True, "parallel_write_safe": True}
